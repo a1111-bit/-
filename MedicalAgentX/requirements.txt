@@ -1,0 +1,23 @@
+# ============================================================
+# MedicalAgentX 医学智能分析系统 - 依赖清单
+# 2026-09 整理：与当前实际运行的代码保持一致
+# ============================================================
+
+# ---------- 核心运行依赖（必装） ----------
+zhipuai>=2.0.0        # 智谱 GLM-4-Flash 大模型 + embedding-2 向量模型
+faiss-cpu>=1.7.4      # 本地向量检索（相似病例检索）
+PyPDF2>=3.0.1         # 解析医学 PDF 文档
+numpy>=1.24.0         # 向量计算（FAISS 依赖）
+gradio>=4.0.0         # Web 界面（medical_web_ui.py）
+
+# ---------- ToolUniverse 医学工具库（必装） ----------
+# 提供 FDA / Monarch / OpenTarget 等 215 个真实医学查询工具。
+requests>=2.31.0      # 调用 FDA / Monarch / OpenTarget 等 HTTP API
+graphql-core>=3.2.0   # GraphQL 查询（OpenTarget 等）
+pyyaml>=6.0           # 解析工具配置
+
+# ---------- 说明 ----------
+# 1. 大模型已从 OpenAI 切换为智谱，不再需要 openai / langchain 等依赖。
+# 2. API key 放在项目根目录 zhipu_api_key.txt（一行一个 key）。
+# 3. 安装命令：
+#      pip install -r requirements.txt
