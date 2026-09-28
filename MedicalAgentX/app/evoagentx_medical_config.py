@@ -10,6 +10,7 @@ True EvoAgentX Medical Intelligence System Configuration
 """
 
 import os
+import logging
 from pathlib import Path
 from typing import Dict, Any, List
 
@@ -29,13 +30,31 @@ ZHIPU_EMBEDDING_MODEL = "embedding-2"             # Embedding 模型（1024维�
 ZHIPU_EMBEDDING_DIM = 1024
 
 def load_api_key() -> str:
-    """加载智谱 API 密钥"""
+    """加载智谱 API 密钥（环境变量优先，其次文件，都没有则返回空串不再抛异常）。
+
+    不再在 import 阶段抛 FileNotFoundError，这样离线单测（不联网、不调模型）
+    也能正常 import 本模块；真正调用模型时才会因空 key 报错。
+    """
+    # 1. 环境变量（推荐，便于部署 / 测试注入）
+    env_key = os.environ.get("ZHIPU_API_KEY", "").strip()
+    if env_key:
+        return env_key
+
+    # 2. 项目根目录文件
     api_key_file = PROJECT_ROOT.parent / "zhipu_api_key.txt"
     try:
         with open(api_key_file, 'r', encoding='utf-8') as f:
-            return f.read().strip()
+            file_key = f.read().strip()
+        if file_key:
+            return file_key
     except FileNotFoundError:
-        raise FileNotFoundError(f"API key文件未找到: {api_key_file}")
+        pass
+
+    logging.getLogger(__name__).warning(
+        f"未找到智谱 API 密钥（环境变量 ZHIPU_API_KEY 或文件 {api_key_file} 均未配置）。"
+        "模型 / Embedding 调用将会失败，请先配置密钥。"
+    )
+    return ""
 
 # API Key
 ZHIPU_API_KEY = load_api_key()
@@ -47,8 +66,7 @@ LLM_CONFIG = {
     "api_key": ZHIPU_API_KEY,
     "temperature": 0.7,           # 适度温度避免模型陷入重复循环
     "max_tokens": 4000,             # 增大输出空间避免截断
-    "stream": False,               # 关闭流式以便解析
-    "output_response": False
+    "stream": False,               # 默认关闭流式；流式输出走单独的 stream 调用
 }
 
 # ============ Embedding 配置 ============
@@ -62,6 +80,17 @@ EMBEDDING_CONFIG = {
 # ============ FAISS 索引配置 ============
 FAISS_INDEX_PATH = str(CACHE_DIR / "faiss_index.index")
 CHUNKS_DATA_PATH = str(CACHE_DIR / "chunks_data.pkl")
+
+# ============ RAG / 检索 / 服务统一参数（engine / workflow / UI 共用，避免散落硬编码） ============
+CHUNK_SIZE = 600        # 文本分块大小
+CHUNK_OVERLAP = 100     # 分块重叠
+TOP_K = 5               # 检索返回数量
+
+RETRY_COUNT = 3         # LLM / Embedding 调用重试次数
+RETRY_BACKOFF = 1.5     # 重试退避基数（秒，指数退避）
+
+SERVER_HOST = "127.0.0.1"
+SERVER_PORT = 7860
 
 # ============ 检索相关性阈值 ============
 # FAISS 用余弦相似度（IndexFlatIP + L2 归一化），score 范围约 [-1, 1]。
@@ -94,16 +123,14 @@ FOLLOWUP_PROMPT = """你是医疗辅助分析系统的报告解读助手。请�
 # 这些字段保留是为了让 evoagentx_medical_workflow.py 的现有 import 不报错
 # 实际 LLM 调用会使用新的 LLM_CONFIG dict
 
-# 系统/工作流配置（保持不变）
+# 系统/工作流配置（只保留真正被使用到的字段）
 SYSTEM_CONFIG = {
-    "max_execution_time": 300,
-    "retry_count": 2,
-    "log_level": "INFO",
-    "save_intermediate_results": True,
-    "medical_disclaimer": True
+    "retry_count": RETRY_COUNT,
 }
 
 # ============ 医疗工作流任务定义（保持原 prompt 不变） ============
+# 注意：每个 task 里的 inputs/outputs/parse_mode 字段仅作文档说明，
+# 实际工作流只读取 name 和 prompt 两个字段。
 MEDICAL_WORKFLOW_TASKS = [
     {
         "name": "MedicalRetriever",
@@ -135,7 +162,10 @@ MEDICAL_WORKFLOW_TASKS = [
 患者症状描述：
 {symptom_text}
 
-请基于给定的症状描述，提供医学案例检索分析：
+系统检索到的相似医学案例：
+{similar_cases}
+
+请基于上述症状描述和检索到的相似案例，提供医学案例检索分析：
 1. 症状关键词识别
 2. 相关医学领域分析
 3. 潜在诊断方向
@@ -267,6 +297,11 @@ MEDICAL_WORKFLOW_TASKS = [
 
 主要诊断方向：
 {primary_diagnoses}
+
+真实医学工具（FDA / Monarch / OpenTarget）查询结果：
+{tool_results}
+
+重要：上面的「真实医学工具查询结果」是系统实际查询得到的证据，请优先引用其中的药物、疾病、基因/靶点信息；只有工具未命中时，才使用通用医学知识补充。
 
 请提供以下方面的专业建议：
 

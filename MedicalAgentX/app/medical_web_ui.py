@@ -5,7 +5,9 @@ EvoAgentX 医疗智能分析系统 - Web UI（多轮对话问诊版）
 
 import os
 import sys
+import json
 import threading
+import time
 import logging
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
@@ -18,7 +20,8 @@ import gradio as gr
 
 import medical_conversation as mc
 from evoagentx_medical_workflow import MedicalWorkflowExecutor
-from evoagentx_medical_config import OUTPUTS_DIR
+from evoagentx_medical_config import OUTPUTS_DIR, SERVER_HOST, SERVER_PORT
+from evoagentx_medical_engine import extract_pdf_text
 
 # 头像图标（放在 assets/ 目录下；Gradio 的 avatar_images 需要真实文件路径）
 _AVATARS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "assets")
@@ -79,12 +82,21 @@ _STAGE_CLASSES = {
 }
 
 
+def _html_escape(text) -> str:
+    """转义 HTML 特殊字符，防止错误信息里的 < > 破坏页面。"""
+    return (text or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
 def _stage_label(session: dict) -> str:
     """把当前阶段渲染成带颜色的状态徽章 HTML（class 化，深色模式下自动换色）。"""
     stage = session.get("stage", mc.STAGE_INTAKE)
     text = _STAGE_LABELS.get(stage, "")
     key = _STAGE_CLASSES.get(stage, "intake")
-    return f'<div class="stage-badge stage-{key}">{text}</div>'
+    html = f'<div class="stage-badge stage-{key}">{text}</div>'
+    last_error = session.get("last_error", "")
+    if last_error:
+        html += f'<div class="error-box">⚠️ 分析出错：{_html_escape(last_error)}</div>'
+    return html
 
 
 def _loading_html(session: dict) -> str:
@@ -112,6 +124,54 @@ def _strip_code_fence(text):
     return s.strip()
 
 
+def _sources_markdown(session: dict) -> str:
+    """从原始检索结果渲染来源表 + 相似度条形，让 RAG 检索依据看得见。"""
+    analysis = session.get("analysis") or {}
+    rag = analysis.get("rag_results") or {}
+    results = rag.get("results") or []
+    if not results:
+        return ""
+    meta = rag.get("search_metadata") or {}
+    lines = ["## 📊 检索来源与相似度\n"]
+    if meta:
+        lines.append(
+            f"语料 `{meta.get('corpus_name', '')}` · top_k={meta.get('top_k', '')} · "
+            f"嵌入 `{meta.get('embedding_model', '')}`（{meta.get('embedding_dim', '')} 维）\n"
+        )
+    lines.append("\n| 排名 | 相似度 | 来源文档 | 片段编号 |")
+    lines.append("| --- | --- | --- | --- |")
+    for r in results:
+        score = max(0.0, min(1.0, float(r.get("score", 0.0))))
+        filled = int(round(score * 20))
+        bar = "█" * filled + "░" * (20 - filled)
+        lines.append(
+            f"| {r.get('rank', '')} | {score:.0%} {bar} | "
+            f"{r.get('document_title', '')} | {r.get('chunk_id', '')} |"
+        )
+    return "\n".join(lines) + "\n"
+
+
+def _tool_status_markdown(tools: dict) -> str:
+    """把真实工具查询结果与可用性渲染成 markdown。"""
+    status = tools.get("real_medical_tools") or {}
+    results = tools.get("tooluniverse_results") or {}
+    lines = []
+    if status.get("tool_engine_initialized"):
+        lines.append(f"✅ 真实医学工具已接入，共 {status.get('medical_tools_count', 0)} 个可用。")
+    else:
+        lines.append("⚠️ ToolUniverse 未初始化，以下为**模拟工具**结果（仅演示）。")
+    comprehensive = results.get("comprehensive_results") or {}
+    summary = comprehensive.get("search_summary") or ""
+    if summary:
+        lines.append(f"查询摘要：{summary}")
+    disease_info = comprehensive.get("disease_information") or {}
+    treatment = comprehensive.get("treatment_guidelines") or {}
+    keys = sorted(set(list(disease_info.keys()) + list(treatment.keys())))
+    if keys:
+        lines.append("命中对象：" + "、".join(f"`{k}`" for k in keys))
+    return "\n".join(lines) if lines else ""
+
+
 def _detail_markdowns(session: dict):
     """从最近一次完整分析结果中取出检索 / 推理 / 工具三块内容。"""
     workflow = (session.get("analysis") or {}).get("workflow_results") or {}
@@ -119,9 +179,12 @@ def _detail_markdowns(session: dict):
     retriever = workflow.get("retriever_output") or {}
     similar_cases = retriever.get("similar_cases") or ""
     retriever_analysis = retriever.get("retriever_analysis") or ""
+    sources_md = _sources_markdown(session)
     rag_md = ""
+    if sources_md:
+        rag_md += sources_md + "\n\n---\n\n"
     if similar_cases:
-        rag_md += "## 📚 检索到的相似医学案例\n\n" + similar_cases + "\n\n---\n\n"
+        rag_md += "## 📚 检索到的相似医学案例（文本）\n\n" + similar_cases + "\n\n---\n\n"
     if retriever_analysis:
         rag_md += "## 🔍 Agent 整理分析\n\n" + retriever_analysis
     if not rag_md:
@@ -144,7 +207,10 @@ def _detail_markdowns(session: dict):
     tools = workflow.get("tools_output") or {}
     tool_consultation = tools.get("tool_consultation") or ""
     additional_guidance = tools.get("additional_guidance") or ""
+    tool_status_md = _tool_status_markdown(tools)
     tools_md = ""
+    if tool_status_md:
+        tools_md += "## 🔧 真实工具查询结果\n\n" + tool_status_md + "\n\n---\n\n"
     if tool_consultation:
         tools_md += "## 💊 工具咨询结果\n\n" + tool_consultation + "\n\n---\n\n"
     if additional_guidance:
@@ -167,11 +233,15 @@ def _report_markdown(session: dict) -> str:
 
 
 def _render(state: dict):
-    """把会话状态渲染为全部 12 个 UI 输出的值。"""
+    """把会话状态渲染为全部 13 个 UI 输出的值。"""
     session = state if isinstance(state, dict) and state else mc.create_session()
     stage = session.get("stage", mc.STAGE_INTAKE)
     rag_md, reasoner_md, tools_md = _detail_markdowns(session)
     report_md = _report_markdown(session)
+    back_visible = (
+        (stage == mc.STAGE_INTAKE and session.get("step_index", 0) > 0)
+        or stage == mc.STAGE_CONFIRM
+    )
     return (
         mc.history_to_chatbot(session),                      # 0 chatbot
         gr.update(value=""),                                 # 1 msg（清空输入框）
@@ -185,19 +255,11 @@ def _render(state: dict):
         tools_md,                                            # 9 tools_md
         report_md,                                           # 10 report_md
         _loading_html(session),                              # 11 loading
+        gr.update(visible=back_visible),                     # 12 返回上一题
     )
 
 
 # ============ 核心流程 ============
-
-def _run_full_analysis(state: dict) -> dict:
-    """执行一次完整 4-Agent 工作流，并把结果写回会话状态。"""
-    executor = get_executor()
-    symptom_text = mc.build_symptom_text(state)
-    retrieval_query = mc.build_retrieval_query(state)
-    result = executor.execute_medical_analysis(symptom_text, retrieval_query=retrieval_query)
-    return mc.record_analysis_result(state, result)
-
 
 def on_send(state, text):
     text = (text or "").strip()
@@ -219,32 +281,174 @@ def on_send(state, text):
     return _render(state)
 
 
-def on_analyze(state):
+# ============ 流式分析（报告逐字 + 步骤进度） ============
+
+def _stream_chatbot(state: dict, extra_text: str):
+    """聊天记录 + 一条正在流式生成的助手消息（用于报告逐字展示）。"""
+    msgs = mc.history_to_chatbot(state)
+    if extra_text:
+        msgs.append({"role": "assistant", "content": extra_text,
+                     "metadata": {"title": "🤖 机器医生"}})
+    return msgs
+
+
+# 报告「打字机」节奏：SDK 的 delta 粒度不定（可能一句/一大段一帧），
+# 这里把到手的文本拆成小片逐字揭示，营造稳定的逐字流式观感。演示时可按需调快/调慢。
+_STREAM_CHARS_PER_TICK = 3    # 每帧揭示的字符数
+_STREAM_TICK_SLEEP = 0.02     # 每帧间隔（秒）
+
+
+def _stream_analysis(state: dict):
+    """把处于 analyzing 阶段的会话流式跑完，逐次 yield 12 个输出。
+
+    前置三步（检索/推理/工具）整体推进、只更新进度气泡；报告阶段逐字写入聊天框。
+    """
+    executor = get_executor()
+    symptom_text = mc.build_symptom_text(state)
+    retrieval_query = mc.build_retrieval_query(state)
+    progress = "🔍 正在检索医学文献并分析…"
+    full_report = ""   # 累计全部 delta（可能一次来一大段）
+    revealed = 0       # 已经揭示到第几个字符（打字机指针）
+    for event in executor.execute_medical_analysis_stream(symptom_text, retrieval_query=retrieval_query):
+        etype = event.get("type")
+        if etype == "progress":
+            progress = event.get("message", progress)
+            base = list(_render(state))
+            base[11] = f'<div class="loading-box"><span class="spinner"></span>{_html_escape(progress)}</div>'
+            yield tuple(base)
+        elif etype == "report_chunk":
+            full_report += event.get("text", "")
+            # 逐字揭示：把新到的文本按固定节奏一小片一小片亮出来
+            while revealed < len(full_report):
+                revealed += _STREAM_CHARS_PER_TICK
+                base = list(_render(state))
+                base[0] = _stream_chatbot(state, full_report[:revealed] + "▌")
+                base[11] = ""  # 报告开始打字后隐藏转圈，让文字自己当进度
+                yield tuple(base)
+                time.sleep(_STREAM_TICK_SLEEP)
+        elif etype == "done":
+            result = event.get("result", {})
+            if result.get("status") == "success":
+                state = mc.record_analysis_result(state, result)
+            else:
+                state = mc.record_analysis_failure(state, result.get("error", "分析失败"))
+            yield _render(state)
+            return
+    yield _render(state)
+
+
+def on_analyze_stream(state):
+    """「开始完整分析」：进入分析阶段后流式跑完整工作流。"""
     state = mc.begin_analysis(state)
     if state.get("stage") != mc.STAGE_ANALYZING:
-        return _render(state)
-    try:
-        state = _run_full_analysis(state)
-    except Exception as e:
-        state = mc.record_analysis_failure(state, str(e))
-    return _render(state)
+        yield _render(state)
+        return
+    yield from _stream_analysis(state)
 
 
-def on_reanalyze(state):
-    """把最新追问并入病例，并立即重跑完整工作流。"""
+def on_reanalyze_stream(state):
+    """「纳入重新分析」：并入最新追问后流式重跑完整工作流。"""
     state = mc.include_last_followup_in_reanalysis(state)
     state = mc.begin_analysis(state)
     if state.get("stage") != mc.STAGE_ANALYZING:
-        return _render(state)
-    try:
-        state = _run_full_analysis(state)
-    except Exception as e:
-        state = mc.record_analysis_failure(state, str(e))
-    return _render(state)
+        yield _render(state)
+        return
+    yield from _stream_analysis(state)
 
 
 def on_restart():
     return _render(mc.create_session())
+
+
+def on_back(state):
+    """「返回上一题」按钮：退回上一步提问并重新提问。"""
+    return _render(mc.go_back(state))
+
+
+# ============ 会话保存 / 加载 ============
+
+_SESSION_DIR = os.path.join(OUTPUTS_DIR, "sessions")
+
+
+def _safe_filename(name: str) -> str:
+    name = (name or "").strip().replace("/", "_").replace("\\", "_").replace("..", "_")
+    return name or "未命名病例"
+
+
+def _save_session(state: dict, name: str) -> str:
+    if not name or not name.strip():
+        return "请先输入保存名称。"
+    os.makedirs(_SESSION_DIR, exist_ok=True)
+    filepath = os.path.join(_SESSION_DIR, _safe_filename(name) + ".json")
+    try:
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        return f"✅ 已保存病例「{name.strip()}」。"
+    except Exception as e:
+        return f"❌ 保存失败：{e}"
+
+
+def _list_sessions() -> list:
+    try:
+        return sorted(fn[:-5] for fn in os.listdir(_SESSION_DIR) if fn.endswith(".json"))
+    except Exception:
+        return []
+
+
+def _load_session(name: str) -> dict:
+    if not name:
+        return mc.create_session()
+    filepath = os.path.join(_SESSION_DIR, _safe_filename(name) + ".json")
+    try:
+        with open(filepath, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        return mc.ConsultationSession.from_dict(state).to_dict()
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"加载病例失败: {e}")
+        return mc.create_session()
+
+
+def on_save(state, name):
+    msg = _save_session(state, name)
+    safe = _safe_filename(name) if name and name.strip() else None
+    return msg, gr.update(choices=_list_sessions(), value=safe)
+
+
+def on_load(name):
+    return _render(_load_session(name))
+
+
+def on_reindex():
+    try:
+        ok = get_executor().medical_rag.index_medical_documents(force_reindex=True)
+        return "✅ 知识库索引已重建。" if ok else "❌ 重建索引失败，请查看服务端日志。"
+    except Exception as e:
+        return f"❌ 重建索引出错：{e}"
+
+
+def on_upload(state, files):
+    """把上传的 PDF/TXT 文本抽取后并入病例资料。"""
+    if not files:
+        return _render(state)
+    if not isinstance(files, (list, tuple)):
+        files = [files]
+    texts = []
+    for f in files:
+        path = f if isinstance(f, str) else getattr(f, "name", None)
+        if not path:
+            continue
+        if path.lower().endswith(".pdf"):
+            texts.append(extract_pdf_text(path))
+        else:
+            for enc in ("utf-8", "gbk"):
+                try:
+                    with open(path, "r", encoding=enc) as fh:
+                        texts.append(fh.read())
+                    break
+                except Exception:
+                    continue
+    joined = "\n\n".join(t.strip() for t in texts if t and t.strip())
+    return _render(mc.record_upload(state, joined))
 
 
 CUSTOM_CSS = """
@@ -425,6 +629,21 @@ body::before {
 :root[data-theme="dark"] .stage-analyzing { color: #fbbf24; background: rgba(245, 158, 11, 0.16); }
 :root[data-theme="dark"] .stage-followup  { color: #2dd4bf; background: rgba(45, 212, 191, 0.14); }
 :root[data-theme="dark"] .stage-emergency { color: #f87171; background: rgba(239, 68, 68, 0.16); }
+
+/* 分析出错提示框 */
+.error-box {
+    margin: 0 0 16px;
+    padding: 10px 14px;
+    background: rgba(220, 38, 38, 0.10);
+    border: 1px solid rgba(220, 38, 38, 0.35);
+    color: #b91c1c;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 500;
+    line-height: 1.6;
+    word-break: break-all;
+}
+:root[data-theme="dark"] .error-box { color: #f87171; background: rgba(239, 68, 68, 0.14); }
 
 /* 顶部技术徽章（去掉装饰 emoji） */
 .tech-badges { margin-top: 16px; display: flex; gap: 8px; justify-content: flex-start; flex-wrap: wrap; }
@@ -655,6 +874,8 @@ def build_ui():
         stage_label = gr.HTML(_stage_label(initial_session))
         progress_html = gr.HTML("")
 
+        back_btn = gr.Button("← 返回上一题", variant="secondary", visible=False)
+
         with gr.Row():
             msg = gr.Textbox(
                 label="💬 输入回答或问题", scale=6,
@@ -662,10 +883,23 @@ def build_ui():
             )
             send_btn = gr.Button("发送", variant="primary", scale=1)
 
+        upload = gr.File(label="📎 上传化验单/检查报告（PDF 或 TXT，可选）",
+                         file_count="multiple", file_types=[".pdf", ".txt"])
+
         with gr.Row():
             analyze_btn = gr.Button("🚀 开始完整分析", variant="primary", visible=False)
             reanalyze_btn = gr.Button("🔄 将此补充纳入重新分析", visible=False)
             restart_btn = gr.Button("🆕 新建病例 / 重新开始", variant="secondary")
+            reindex_btn = gr.Button("🔄 重建知识库索引", variant="secondary")
+
+        with gr.Row():
+            save_name = gr.Textbox(label="💾 保存名称", scale=4,
+                                   placeholder="给这次病例起个名字，如「张三-高血压」")
+            save_btn = gr.Button("保存病例", scale=1)
+            session_dropdown = gr.Dropdown(label="📂 已保存病例", choices=_list_sessions(), scale=4)
+            load_btn = gr.Button("加载", scale=1)
+        save_status = gr.Markdown("")
+        reindex_status = gr.Markdown("")
 
         with gr.Tabs():
             with gr.Tab("📄 完整报告"):
@@ -688,13 +922,18 @@ def build_ui():
 
         outputs = [chatbot, msg, state, stage_label,
                    analyze_btn, reanalyze_btn, restart_btn,
-                   rag_md, reasoner_md, tools_md, report_md, progress_html]
+                   rag_md, reasoner_md, tools_md, report_md, progress_html, back_btn]
 
         send_btn.click(fn=on_send, inputs=[state, msg], outputs=outputs)
         msg.submit(fn=on_send, inputs=[state, msg], outputs=outputs)
-        analyze_btn.click(fn=on_analyze, inputs=[state], outputs=outputs)
-        reanalyze_btn.click(fn=on_reanalyze, inputs=[state], outputs=outputs)
+        analyze_btn.click(fn=on_analyze_stream, inputs=[state], outputs=outputs)
+        reanalyze_btn.click(fn=on_reanalyze_stream, inputs=[state], outputs=outputs)
         restart_btn.click(fn=on_restart, outputs=outputs)
+        back_btn.click(fn=on_back, inputs=[state], outputs=outputs)
+        save_btn.click(fn=on_save, inputs=[state, save_name], outputs=[save_status, session_dropdown])
+        load_btn.click(fn=on_load, inputs=[session_dropdown], outputs=outputs)
+        reindex_btn.click(fn=on_reindex, outputs=[reindex_status])
+        upload.change(fn=on_upload, inputs=[state, upload], outputs=outputs)
 
     return demo
 
@@ -708,14 +947,14 @@ if __name__ == "__main__":
     print("=" * 60)
     print("🏥 EvoAgentX 医疗智能分析系统 - Web UI（多轮对话问诊版）")
     print("=" * 60)
-    print("📡 服务地址: http://127.0.0.1:7860")
+    print(f"📡 服务地址: http://{SERVER_HOST}:{SERVER_PORT}")
     print("⏹️  按 Ctrl+C 退出")
     print("=" * 60)
 
     demo = build_ui()
     demo.launch(
-        server_name="127.0.0.1",
-        server_port=7860,
+        server_name=SERVER_HOST,
+        server_port=SERVER_PORT,
         show_error=True,
         inbrowser=False,
         head=_HEAD_HTML,

@@ -175,5 +175,51 @@ class TestHelpers(unittest.TestCase):
         self.assertIn("发热、咳嗽 3 天", query)
 
 
+class TestGoBack(unittest.TestCase):
+    def test_go_back_after_first_answer(self):
+        state = mc.handle_user_message(mc.create_session(), "发热")
+        self.assertEqual(state["step_index"], 1)
+        out = mc.go_back(state)
+        self.assertEqual(out["step_index"], 0)
+        self.assertNotIn("chief_complaint", out["patient"])
+        self.assertIn("请重新回答上一项", out["history"][-1]["content"])
+
+    def test_go_back_at_first_question_is_noop(self):
+        state = mc.create_session()
+        out = mc.go_back(state)
+        self.assertEqual(out["step_index"], 0)
+        self.assertIn("已经是第一项提问", out["history"][-1]["content"])
+
+    def test_go_back_clears_demographics_both_keys(self):
+        state = _drive(mc.create_session(), ["发热", "58 岁，男性"])
+        self.assertEqual(state["step_index"], 2)
+        out = mc.go_back(state)
+        self.assertEqual(out["step_index"], 1)
+        self.assertNotIn("age", out["patient"])
+        self.assertNotIn("gender", out["patient"])
+        self.assertIn("chief_complaint", out["patient"])
+
+    def test_go_back_from_confirm_returns_to_last_step(self):
+        state = _drive(mc.create_session(), INTAKE_ANSWERS)
+        self.assertEqual(state["stage"], mc.STAGE_CONFIRM)
+        out = mc.go_back(state)
+        self.assertEqual(out["stage"], mc.STAGE_INTAKE)
+        self.assertEqual(out["step_index"], len(mc.INTAKE_STEPS) - 1)
+        self.assertNotIn("extra", out["patient"])
+
+    def test_text_keyword_triggers_go_back(self):
+        state = mc.handle_user_message(mc.create_session(), "发热")
+        state = mc.handle_user_message(state, "返回上一题")
+        self.assertEqual(state["step_index"], 0)
+
+    def test_go_back_ignored_outside_intake(self):
+        state = mc.create_session()
+        state["stage"] = mc.STAGE_FOLLOWUP
+        state["step_index"] = 3
+        out = mc.go_back(state)
+        self.assertEqual(out["stage"], mc.STAGE_FOLLOWUP)
+        self.assertEqual(out["step_index"], 3)
+
+
 if __name__ == "__main__":
     unittest.main()

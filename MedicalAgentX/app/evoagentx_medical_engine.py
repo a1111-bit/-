@@ -22,10 +22,12 @@ import PyPDF2
 from zhipuai import ZhipuAI
 
 from evoagentx_medical_config import (
-    DATA_DIR, CACHE_DIR, OUTPUTS_DIR, PROJECT_ROOT,
+    DATA_DIR, CACHE_DIR,
     ZHIPU_API_KEY,
     ZHIPU_EMBEDDING_MODEL, ZHIPU_EMBEDDING_DIM,
-    FAISS_INDEX_PATH, CHUNKS_DATA_PATH, EMBEDDING_CONFIG,
+    FAISS_INDEX_PATH, CHUNKS_DATA_PATH,
+    CHUNK_SIZE, CHUNK_OVERLAP, TOP_K,
+    RETRY_COUNT, RETRY_BACKOFF,
     SIMILARITY_THRESHOLD
 )
 
@@ -48,13 +50,20 @@ def filter_relevant_results(results: List[Dict], threshold: float) -> Dict[str, 
     }
 
 
+def extract_pdf_text(pdf_path) -> str:
+    """从 PDF 文件抽取纯文本（索引构建与用户上传资料共用）。"""
+    try:
+        with open(pdf_path, "rb") as file:
+            pdf_reader = PyPDF2.PdfReader(file)
+            pages = [page.extract_text() or "" for page in pdf_reader.pages]
+        return "\n".join(pages)
+    except Exception as e:
+        logging.getLogger(__name__).warning(f"无法从 {pdf_path} 提取文本: {e}")
+        return ""
+
+
 class MedicalRAGEngine:
     """基于FAISS的医疗文档RAG引擎（智谱 embedding-2）"""
-
-    # 分块配置（与原 EvoAgentX RAG_CONFIG 保持一致）
-    CHUNK_SIZE = 600
-    CHUNK_OVERLAP = 100
-    TOP_K = 5
 
     def __init__(self):
         """初始化医疗RAG引擎"""
@@ -64,6 +73,11 @@ class MedicalRAGEngine:
         self.embed_client = ZhipuAI(api_key=ZHIPU_API_KEY)
         self.embedding_model = ZHIPU_EMBEDDING_MODEL
         self.embedding_dim = ZHIPU_EMBEDDING_DIM
+
+        # 分块 / 检索参数（从 config 统一读取，避免散落硬编码）
+        self.chunk_size = CHUNK_SIZE
+        self.chunk_overlap = CHUNK_OVERLAP
+        self.top_k = TOP_K
 
         # FAISS 索引（懒加载）
         self.faiss_index = None
@@ -84,9 +98,11 @@ class MedicalRAGEngine:
         try:
             # 检查是否已经建立索引
             if not force_reindex and self._load_existing_index():
-                self.logger.info("发现现有索引，跳过重建")
-                self.is_indexed = True
-                return True
+                if not self.index_is_stale():
+                    self.logger.info("发现现有索引，跳过重建")
+                    self.is_indexed = True
+                    return True
+                self.logger.warning("检测到 PDF 文档比索引新，索引可能过期，自动重建")
 
             # 获取PDF文件列表
             pdf_files = sorted(list(DATA_DIR.glob("*.pdf")))
@@ -143,18 +159,13 @@ class MedicalRAGEngine:
         """处理单个PDF文件，返回 chunks 字典列表"""
         chunks = []
         try:
-            with open(pdf_file, "rb") as file:
-                pdf_reader = PyPDF2.PdfReader(file)
-                text = ""
-                for page in pdf_reader.pages:
-                    page_text = page.extract_text() or ""
-                    text += page_text + "\n"
+            text = extract_pdf_text(pdf_file)
 
             if not text.strip():
                 self.logger.warning(f"无法从 {pdf_file.name} 提取文本")
                 return chunks
 
-            text_chunks = self._chunk_text(text, self.CHUNK_SIZE, self.CHUNK_OVERLAP)
+            text_chunks = self._chunk_text(text, self.chunk_size, self.chunk_overlap)
 
             for i, chunk_text in enumerate(text_chunks):
                 if chunk_text.strip():
@@ -212,45 +223,73 @@ class MedicalRAGEngine:
             self.logger.warning(f"加载现有索引失败: {e}")
             return False
 
+    def index_is_stale(self) -> bool:
+        """判断索引是否过期（有 PDF 比索引文件新，说明加/改了资料但没重建）。"""
+        try:
+            pdf_files = list(DATA_DIR.glob("*.pdf"))
+            if not pdf_files:
+                return False
+            index_path = Path(FAISS_INDEX_PATH)
+            if not index_path.exists():
+                return True  # 还没建过索引
+            newest_pdf_mtime = max(p.stat().st_mtime for p in pdf_files)
+            return newest_pdf_mtime > index_path.stat().st_mtime
+        except Exception:
+            return False
+
     # ============ Embedding 调用 ============
 
     def _batch_embed(self, texts: List[str], batch_size: int = 16) -> Any:
-        """批量调用智谱 Embedding API"""
+        """批量调用智谱 Embedding API（带重试，单批次失败不再拖垮整个重建）"""
         all_vectors = []
         for i in range(0, len(texts), batch_size):
             batch = texts[i:i + batch_size]
             # 去掉两端空白，避免空字符串
             batch = [t.strip() or "空" for t in batch]
-            try:
-                resp = self.embed_client.embeddings.create(
-                    model=self.embedding_model,
-                    input=batch
-                )
-                for item in resp.data:
-                    all_vectors.append(item.embedding)
-                self.logger.info(f"已向量化 {min(i + batch_size, len(texts))}/{len(texts)}")
-            except Exception as e:
-                self.logger.error(f"Embedding 批次 {i} 失败: {e}")
+            last_error = None
+            for attempt in range(RETRY_COUNT):
+                try:
+                    resp = self.embed_client.embeddings.create(
+                        model=self.embedding_model,
+                        input=batch
+                    )
+                    for item in resp.data:
+                        all_vectors.append(item.embedding)
+                    self.logger.info(f"已向量化 {min(i + batch_size, len(texts))}/{len(texts)}")
+                    break
+                except Exception as e:
+                    last_error = e
+                    self.logger.warning(f"Embedding 批次 {i} 第 {attempt + 1} 次失败: {e}")
+                    if attempt < RETRY_COUNT - 1:
+                        time.sleep(RETRY_BACKOFF * (attempt + 1))
+            else:
+                self.logger.error(f"Embedding 批次 {i} 重试 {RETRY_COUNT} 次后仍失败: {last_error}")
                 return None
             # 简单限速，避免触发 API 限流
             time.sleep(0.2)
         return all_vectors
 
     def _embed_query(self, text: str) -> Any:
-        """单条查询向量化（带缓存）"""
+        """单条查询向量化（带缓存与重试）"""
         if text in self._embed_cache:
             return self._embed_cache[text]
-        try:
-            resp = self.embed_client.embeddings.create(
-                model=self.embedding_model,
-                input=text.strip() or "空"
-            )
-            vec = resp.data[0].embedding
-            self._embed_cache[text] = vec
-            return vec
-        except Exception as e:
-            self.logger.error(f"查询向量化失败: {e}")
-            return None
+        last_error = None
+        for attempt in range(RETRY_COUNT):
+            try:
+                resp = self.embed_client.embeddings.create(
+                    model=self.embedding_model,
+                    input=text.strip() or "空"
+                )
+                vec = resp.data[0].embedding
+                self._embed_cache[text] = vec
+                return vec
+            except Exception as e:
+                last_error = e
+                self.logger.warning(f"查询向量化第 {attempt + 1} 次失败: {e}")
+                if attempt < RETRY_COUNT - 1:
+                    time.sleep(RETRY_BACKOFF * (attempt + 1))
+        self.logger.error(f"查询向量化失败: {last_error}")
+        return None
 
     # ============ 检索 ============
 
@@ -267,7 +306,7 @@ class MedicalRAGEngine:
                     }
                 self.is_indexed = True
 
-            top_k = top_k or self.TOP_K
+            top_k = top_k or self.top_k
             query_vec = self._embed_query(query_text)
             if query_vec is None:
                 return {"status": "error", "error": "查询向量化失败", "results": []}
@@ -326,43 +365,21 @@ class MedicalRAGEngine:
             return {
                 "corpus_name": self.corpus_name,
                 "is_indexed": self.is_indexed,
+                "index_stale": self.index_is_stale(),
                 "storage_path": str(CACHE_DIR),
                 "total_documents": len(list(DATA_DIR.glob("*.pdf"))),
                 "total_chunks": len(self.chunks_data),
                 "rag_config": {
-                    "chunk_size": self.CHUNK_SIZE,
-                    "chunk_overlap": self.CHUNK_OVERLAP,
+                    "chunk_size": self.chunk_size,
+                    "chunk_overlap": self.chunk_overlap,
                     "embedding_model": self.embedding_model,
                     "embedding_dim": self.embedding_dim,
-                    "top_k": self.TOP_K
+                    "top_k": self.top_k
                 }
             }
         except Exception as e:
             self.logger.error(f"获取语料库信息时出错: {str(e)}")
             return {}
-
-    def save_search_results(self, results: Dict[str, Any], query: str) -> str:
-        """保存搜索结果"""
-        try:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"medical_search_{timestamp}.json"
-            filepath = OUTPUTS_DIR / "results" / filename
-            filepath.parent.mkdir(parents=True, exist_ok=True)
-
-            save_data = {
-                "query": query,
-                "timestamp": datetime.now().isoformat(),
-                "engine_info": self.get_corpus_info(),
-                "search_results": results
-            }
-            with open(filepath, "w", encoding="utf-8") as f:
-                json.dump(save_data, f, ensure_ascii=False, indent=2)
-            self.logger.info(f"搜索结果已保存到: {filepath}")
-            return str(filepath)
-        except Exception as e:
-            self.logger.error(f"保存搜索结果时出错: {str(e)}")
-            return ""
-
 
 def main():
     """测试医疗RAG引擎"""

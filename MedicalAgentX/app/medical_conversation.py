@@ -104,6 +104,9 @@ EMERGENCY_PATTERNS = {
 
 SKIP_RESPONSES = {"无", "没有", "不清楚", "不知道", "跳过", "未提供", "不详"}
 
+# 在输入框里输入这些词会触发「返回上一题」（与按钮等价）
+GO_BACK_KEYWORDS = {"返回上一题", "上一题", "重新回答上一题", "返回上一步"}
+
 
 @dataclass
 class ConsultationSession:
@@ -236,6 +239,41 @@ def _record_intake_answer(session: ConsultationSession, answer: str) -> Optional
     return None
 
 
+def _clear_step(session: ConsultationSession, index: int) -> None:
+    """清掉第 index 项提问已记录的答案（demographics 要同时清 age 与 gender）。"""
+    key = INTAKE_STEPS[index]["key"]
+    if key == "demographics":
+        session.patient.pop("age", None)
+        session.patient.pop("gender", None)
+    else:
+        session.patient.pop(key, None)
+
+
+def _go_back(session: ConsultationSession) -> bool:
+    """把问诊退回到上一项提问并重新提问；返回是否成功退回。"""
+    if session.stage == STAGE_CONFIRM:
+        session.stage = STAGE_INTAKE  # 从确认页退回最后一项提问
+    elif session.stage != STAGE_INTAKE:
+        return False  # 分析中 / 追问 / 急诊等阶段不可返回
+
+    if session.step_index <= 0:
+        _assistant(session, "这已经是第一项提问了，无法再返回上一题。")
+        return False
+
+    target = session.step_index - 1
+    _clear_step(session, target)
+    session.step_index = target
+    _assistant(session, "好的，请重新回答上一项：\n\n" + INTAKE_STEPS[target]["prompt"])
+    return True
+
+
+def go_back(state: Dict[str, Any]) -> Dict[str, Any]:
+    """「返回上一题」按钮入口：退回一步并重新提问。"""
+    session = ConsultationSession.from_dict(deepcopy(state))
+    _go_back(session)
+    return session.to_dict()
+
+
 def handle_user_message(state: Optional[Dict[str, Any]], text: str) -> Dict[str, Any]:
     """处理一次用户输入，不包含模型调用。"""
     session = ConsultationSession.from_dict(deepcopy(state))
@@ -248,6 +286,11 @@ def handle_user_message(state: Optional[Dict[str, Any]], text: str) -> Dict[str,
 
     if session.stage == STAGE_EMERGENCY:
         _assistant(session, "当前会话已停止常规问诊。请优先获得线下紧急医疗帮助，或点击“新建病例”开始新的会话。")
+        return session.to_dict()
+
+    # 「返回上一题」文字指令：在当作普通回答之前拦截
+    if session.stage in (STAGE_INTAKE, STAGE_CONFIRM) and message in GO_BACK_KEYWORDS:
+        _go_back(session)
         return session.to_dict()
 
     _user(session, message)
@@ -346,6 +389,27 @@ def include_last_followup_in_reanalysis(state: Dict[str, Any]) -> Dict[str, Any]
     _assistant(
         session,
         "已将最新补充纳入病例。请核对更新后的信息，再点击“开始完整分析”生成新版报告。\n\n"
+        + build_case_summary(session.to_dict()),
+    )
+    return session.to_dict()
+
+
+def record_upload(state: Dict[str, Any], text: str) -> Dict[str, Any]:
+    """把上传文件抽取的文本并入「生命体征/检查结果」栏，供用户核对。"""
+    session = ConsultationSession.from_dict(deepcopy(state))
+    text = (text or "").strip()
+    if not text:
+        _assistant(session, "未能从上传文件中提取到文字，请换用 PDF 或 TXT 文件。")
+        return session.to_dict()
+    existing = session.patient.get("vitals_tests", "")
+    if existing in ("", UNKNOWN_VALUE):
+        session.patient["vitals_tests"] = text
+    else:
+        session.patient["vitals_tests"] = f"{existing}\n上传资料：{text}"
+    session.stage = STAGE_CONFIRM
+    _assistant(
+        session,
+        "已将上传文件的内容并入「生命体征/检查结果」。请核对病例摘要后点击“开始完整分析”。\n\n"
         + build_case_summary(session.to_dict()),
     )
     return session.to_dict()
