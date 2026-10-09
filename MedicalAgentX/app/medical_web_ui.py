@@ -5,10 +5,10 @@ EvoAgentX 医疗智能分析系统 - Web UI（多轮对话问诊版）
 
 import os
 import sys
-import json
 import threading
 import time
 import logging
+from datetime import datetime
 
 os.environ.setdefault("PYTHONIOENCODING", "utf-8")
 # Windows 控制台默认 GBK 编码无法输出 emoji，强制改用 UTF-8（os.environ 只影响子进程，需 reconfigure 当前进程）
@@ -19,8 +19,9 @@ if hasattr(sys.stdout, "reconfigure"):
 import gradio as gr
 
 import medical_conversation as mc
+import medical_auth as auth
 from evoagentx_medical_workflow import MedicalWorkflowExecutor
-from evoagentx_medical_config import OUTPUTS_DIR, SERVER_HOST, SERVER_PORT
+from evoagentx_medical_config import SERVER_HOST, SERVER_PORT
 from evoagentx_medical_engine import extract_pdf_text
 
 # 头像图标（放在 assets/ 目录下；Gradio 的 avatar_images 需要真实文件路径）
@@ -261,10 +262,20 @@ def _render(state: dict):
 
 # ============ 核心流程 ============
 
-def on_send(state, text):
+def _autosave_extra(current_user, conv_name, state):
+    """登录后把当前会话自动存到该账户。返回 (新的会话名, 历史下拉框更新)。"""
+    if not current_user:
+        return conv_name, gr.update()
+    if not conv_name:
+        conv_name = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    auth.save_conversation(current_user, conv_name, state)
+    return conv_name, gr.update(choices=auth.list_conversations(current_user), value=conv_name)
+
+
+def on_send(state, text, current_user, conv_name):
     text = (text or "").strip()
     if not text:
-        return _render(state)
+        return _render(state) + (conv_name, gr.update())
 
     state = mc.handle_user_message(state, text)
 
@@ -278,7 +289,8 @@ def on_send(state, text):
         )
         state = mc.record_followup_answer(state, answer)
 
-    return _render(state)
+    conv_name, dropdown = _autosave_extra(current_user, conv_name, state)
+    return _render(state) + (conv_name, dropdown)
 
 
 # ============ 流式分析（报告逐字 + 步骤进度） ============
@@ -298,10 +310,11 @@ _STREAM_CHARS_PER_TICK = 3    # 每帧揭示的字符数
 _STREAM_TICK_SLEEP = 0.02     # 每帧间隔（秒）
 
 
-def _stream_analysis(state: dict):
-    """把处于 analyzing 阶段的会话流式跑完，逐次 yield 12 个输出。
+def _stream_analysis(state: dict, current_user, conv_name):
+    """把处于 analyzing 阶段的会话流式跑完，逐次 yield 15 个输出。
 
     前置三步（检索/推理/工具）整体推进、只更新进度气泡；报告阶段逐字写入聊天框。
+    分析完成后自动保存到当前账户。
     """
     executor = get_executor()
     symptom_text = mc.build_symptom_text(state)
@@ -315,7 +328,7 @@ def _stream_analysis(state: dict):
             progress = event.get("message", progress)
             base = list(_render(state))
             base[11] = f'<div class="loading-box"><span class="spinner"></span>{_html_escape(progress)}</div>'
-            yield tuple(base)
+            yield tuple(base) + (conv_name, gr.update())
         elif etype == "report_chunk":
             full_report += event.get("text", "")
             # 逐字揭示：把新到的文本按固定节奏一小片一小片亮出来
@@ -324,7 +337,7 @@ def _stream_analysis(state: dict):
                 base = list(_render(state))
                 base[0] = _stream_chatbot(state, full_report[:revealed] + "▌")
                 base[11] = ""  # 报告开始打字后隐藏转圈，让文字自己当进度
-                yield tuple(base)
+                yield tuple(base) + (conv_name, gr.update())
                 time.sleep(_STREAM_TICK_SLEEP)
         elif etype == "done":
             result = event.get("result", {})
@@ -332,90 +345,129 @@ def _stream_analysis(state: dict):
                 state = mc.record_analysis_result(state, result)
             else:
                 state = mc.record_analysis_failure(state, result.get("error", "分析失败"))
-            yield _render(state)
+            conv_name, dropdown = _autosave_extra(current_user, conv_name, state)
+            yield _render(state) + (conv_name, dropdown)
             return
-    yield _render(state)
+    conv_name, dropdown = _autosave_extra(current_user, conv_name, state)
+    yield _render(state) + (conv_name, dropdown)
 
 
-def on_analyze_stream(state):
+def on_analyze_stream(state, current_user, conv_name):
     """「开始完整分析」：进入分析阶段后流式跑完整工作流。"""
     state = mc.begin_analysis(state)
     if state.get("stage") != mc.STAGE_ANALYZING:
-        yield _render(state)
+        conv_name, dropdown = _autosave_extra(current_user, conv_name, state)
+        yield _render(state) + (conv_name, dropdown)
         return
-    yield from _stream_analysis(state)
+    yield from _stream_analysis(state, current_user, conv_name)
 
 
-def on_reanalyze_stream(state):
+def on_reanalyze_stream(state, current_user, conv_name):
     """「纳入重新分析」：并入最新追问后流式重跑完整工作流。"""
     state = mc.include_last_followup_in_reanalysis(state)
     state = mc.begin_analysis(state)
     if state.get("stage") != mc.STAGE_ANALYZING:
-        yield _render(state)
+        conv_name, dropdown = _autosave_extra(current_user, conv_name, state)
+        yield _render(state) + (conv_name, dropdown)
         return
-    yield from _stream_analysis(state)
+    yield from _stream_analysis(state, current_user, conv_name)
 
 
 def on_restart():
-    return _render(mc.create_session())
+    return _render(mc.create_session()) + ("", gr.update())
 
 
-def on_back(state):
+def on_back(state, current_user, conv_name):
     """「返回上一题」按钮：退回上一步提问并重新提问。"""
-    return _render(mc.go_back(state))
+    return _render(mc.go_back(state)) + (conv_name, gr.update())
 
 
-# ============ 会话保存 / 加载 ============
+# ============ 会话保存 / 加载（按用户隔离，存入 SQLite） ============
 
-_SESSION_DIR = os.path.join(OUTPUTS_DIR, "sessions")
-
-
-def _safe_filename(name: str) -> str:
-    name = (name or "").strip().replace("/", "_").replace("\\", "_").replace("..", "_")
-    return name or "未命名病例"
-
-
-def _save_session(state: dict, name: str) -> str:
-    if not name or not name.strip():
-        return "请先输入保存名称。"
-    os.makedirs(_SESSION_DIR, exist_ok=True)
-    filepath = os.path.join(_SESSION_DIR, _safe_filename(name) + ".json")
-    try:
-        with open(filepath, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, indent=2)
-        return f"✅ 已保存病例「{name.strip()}」。"
-    except Exception as e:
-        return f"❌ 保存失败：{e}"
-
-
-def _list_sessions() -> list:
-    try:
-        return sorted(fn[:-5] for fn in os.listdir(_SESSION_DIR) if fn.endswith(".json"))
-    except Exception:
-        return []
-
-
-def _load_session(name: str) -> dict:
+def on_save(state, name, current_user, conv_name):
+    if not current_user:
+        return "请先登录后再保存。", gr.update(), conv_name
+    name = (name or "").strip()
     if not name:
-        return mc.create_session()
-    filepath = os.path.join(_SESSION_DIR, _safe_filename(name) + ".json")
+        return "请先输入保存名称。", gr.update(choices=auth.list_conversations(current_user)), conv_name
+    auth.save_conversation(current_user, name, state)
+    return (f"✅ 已保存病例「{name}」。",
+            gr.update(choices=auth.list_conversations(current_user), value=name),
+            name)
+
+
+def on_load(name, current_user):
+    if not current_user or not name:
+        return _render(mc.create_session()) + ("", gr.update())
+    data = auth.load_conversation(current_user, name)
+    if data is None:
+        return _render(mc.create_session()) + ("", gr.update())
     try:
-        with open(filepath, "r", encoding="utf-8") as f:
-            state = json.load(f)
-        return mc.ConsultationSession.from_dict(state).to_dict()
+        state = mc.ConsultationSession.from_dict(data).to_dict()
     except Exception as e:
         logging.getLogger(__name__).warning(f"加载病例失败: {e}")
-        return mc.create_session()
+        state = mc.create_session()
+    return _render(state) + (name, gr.update())
 
 
-def on_save(state, name):
-    msg = _save_session(state, name)
-    safe = _safe_filename(name) if name and name.strip() else None
-    return msg, gr.update(choices=_list_sessions(), value=safe)
+# ============ 登录 / 注册 / 退出 ============
+
+def _fresh_chat_values():
+    """返回一个全新空问诊的 13 项聊天输出（登录/退出时用于重置聊天区）。"""
+    return list(_render(mc.create_session()))
 
 
-def on_load(name):
-    return _render(_load_session(name))
+def _login_success(username):
+    return (
+        f"✅ 欢迎回来，{username}！",
+        username,                                       # current_user
+        "",                                             # conv_name
+        gr.update(visible=False),                       # login_col 隐藏
+        gr.update(visible=True),                        # chat_col 显示
+        f"👤 当前用户：**{username}**",                  # user_label
+        gr.update(choices=auth.list_conversations(username)),  # history_dropdown
+    ) + tuple(_fresh_chat_values())
+
+
+def _login_fail(msg):
+    return (
+        f"❌ {msg}",
+        None,                                           # current_user 保持未登录
+        "",                                             # conv_name
+        gr.update(visible=True),                        # login_col 保持显示
+        gr.update(visible=False),                       # chat_col 保持隐藏
+        "",                                             # user_label
+        gr.update(choices=[]),                          # history_dropdown 清空
+    ) + tuple(_fresh_chat_values())
+
+
+def on_login(username, password):
+    err = auth.login(username, password)
+    if err:
+        return _login_fail(err)
+    return _login_success((username or "").strip())
+
+
+def on_register(username, password):
+    err = auth.register(username, password)
+    username = (username or "").strip()
+    if err:
+        return f"❌ {err}", username, password
+    return "✅ 注册成功，请登录。", username, ""
+
+
+def on_logout():
+    return (
+        None,                                           # current_user
+        "",                                             # conv_name
+        gr.update(visible=True),                        # login_col 显示
+        gr.update(visible=False),                       # chat_col 隐藏
+        "",                                             # user_label
+        "",                                             # auth_status
+        gr.update(choices=[]),                          # history_dropdown
+        gr.update(value=""),                            # username 清空
+        gr.update(value=""),                            # password 清空
+    )
 
 
 def on_reindex():
@@ -426,10 +478,10 @@ def on_reindex():
         return f"❌ 重建索引出错：{e}"
 
 
-def on_upload(state, files):
+def on_upload(state, files, current_user, conv_name):
     """把上传的 PDF/TXT 文本抽取后并入病例资料。"""
     if not files:
-        return _render(state)
+        return _render(state) + (conv_name, gr.update())
     if not isinstance(files, (list, tuple)):
         files = [files]
     texts = []
@@ -448,7 +500,9 @@ def on_upload(state, files):
                 except Exception:
                     continue
     joined = "\n\n".join(t.strip() for t in texts if t and t.strip())
-    return _render(mc.record_upload(state, joined))
+    state = mc.record_upload(state, joined)
+    conv_name, dropdown = _autosave_extra(current_user, conv_name, state)
+    return _render(state) + (conv_name, dropdown)
 
 
 CUSTOM_CSS = """
@@ -804,6 +858,18 @@ button:focus-visible, input:focus-visible, textarea:focus-visible {
 }
 :root[data-theme="dark"] .theme-toggle:hover { background: #164e63; border-color: #a5f3fc; }
 
+/* ============ 登录 / 注册面板 ============ */
+.login-panel {
+    max-width: 420px;
+    margin: 24px auto 0;
+    padding: 28px 24px;
+    background: var(--background-fill-primary);
+    border: 1px solid var(--border-color-primary);
+    border-radius: 16px;
+    box-shadow: 0 8px 24px rgba(8, 145, 178, 0.12);
+}
+.login-panel h2 { margin-top: 0; }
+
 /* 尊重系统「减少动态效果」设置 */
 @media (prefers-reduced-motion: reduce) {
     * { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
@@ -866,74 +932,107 @@ def build_ui():
         """.replace("__HERO_IMG__", _HERO_IMG_URL))
 
         initial_session = mc.create_session()
-        chatbot = gr.Chatbot(
-            label="问诊对话", height=520, elem_classes=["chat-panel"],
-            avatar_images=[_AVATAR_USER, _AVATAR_BOT],
-            value=mc.history_to_chatbot(initial_session),
-        )
-        stage_label = gr.HTML(_stage_label(initial_session))
-        progress_html = gr.HTML("")
 
-        back_btn = gr.Button("← 返回上一题", variant="secondary", visible=False)
+        # ---- 登录 / 注册面板（未登录时显示） ----
+        with gr.Column(visible=True, elem_classes=["login-panel"]) as login_col:
+            gr.Markdown("## 🔐 登录 / 注册")
+            username = gr.Textbox(label="用户名", placeholder="输入用户名")
+            password = gr.Textbox(label="密码", type="password", placeholder="输入密码")
+            with gr.Row():
+                login_btn = gr.Button("登录", variant="primary")
+                register_btn = gr.Button("注册", variant="secondary")
+            auth_status = gr.Markdown("")
 
-        with gr.Row():
-            msg = gr.Textbox(
-                label="💬 输入回答或问题", scale=6,
-                placeholder="在这里输入你的回答或问题，回车发送…"
+        # ---- 聊天区（登录后显示） ----
+        with gr.Column(visible=False) as chat_col:
+            with gr.Row():
+                user_label = gr.Markdown("")
+                logout_btn = gr.Button("退出登录", variant="secondary")
+
+            chatbot = gr.Chatbot(
+                label="问诊对话", height=520, elem_classes=["chat-panel"],
+                avatar_images=[_AVATAR_USER, _AVATAR_BOT],
+                value=mc.history_to_chatbot(initial_session),
             )
-            send_btn = gr.Button("发送", variant="primary", scale=1)
+            stage_label = gr.HTML(_stage_label(initial_session))
+            progress_html = gr.HTML("")
 
-        upload = gr.File(label="📎 上传化验单/检查报告（PDF 或 TXT，可选）",
-                         file_count="multiple", file_types=[".pdf", ".txt"])
+            back_btn = gr.Button("← 返回上一题", variant="secondary", visible=False)
 
-        with gr.Row():
-            analyze_btn = gr.Button("🚀 开始完整分析", variant="primary", visible=False)
-            reanalyze_btn = gr.Button("🔄 将此补充纳入重新分析", visible=False)
-            restart_btn = gr.Button("🆕 新建病例 / 重新开始", variant="secondary")
-            reindex_btn = gr.Button("🔄 重建知识库索引", variant="secondary")
+            with gr.Row():
+                msg = gr.Textbox(
+                    label="💬 输入回答或问题", scale=6,
+                    placeholder="在这里输入你的回答或问题，回车发送…"
+                )
+                send_btn = gr.Button("发送", variant="primary", scale=1)
 
-        with gr.Row():
-            save_name = gr.Textbox(label="💾 保存名称", scale=4,
-                                   placeholder="给这次病例起个名字，如「张三-高血压」")
-            save_btn = gr.Button("保存病例", scale=1)
-            session_dropdown = gr.Dropdown(label="📂 已保存病例", choices=_list_sessions(), scale=4)
-            load_btn = gr.Button("加载", scale=1)
-        save_status = gr.Markdown("")
-        reindex_status = gr.Markdown("")
+            upload = gr.File(label="📎 上传化验单/检查报告（PDF 或 TXT，可选）",
+                             file_count="multiple", file_types=[".pdf", ".txt"])
 
-        with gr.Tabs():
-            with gr.Tab("📄 完整报告"):
-                report_md = gr.Markdown("_（分析完成后此处将显示完整报告）_", elem_classes=["report-md"])
-            with gr.Tab("📚 检索详情"):
-                rag_md = gr.Markdown("_（暂无检索结果）_", elem_classes=["detail-md"])
-            with gr.Tab("🧠 推理详情"):
-                reasoner_md = gr.Markdown("_（暂无推理结果）_", elem_classes=["detail-md"])
-            with gr.Tab("💊 工具详情"):
-                tools_md = gr.Markdown("_（暂无工具咨询结果）_", elem_classes=["detail-md"])
+            with gr.Row():
+                analyze_btn = gr.Button("🚀 开始完整分析", variant="primary", visible=False)
+                reanalyze_btn = gr.Button("🔄 将此补充纳入重新分析", visible=False)
+                restart_btn = gr.Button("🆕 新建病例 / 重新开始", variant="secondary")
+                reindex_btn = gr.Button("🔄 重建知识库索引", variant="secondary")
+
+            with gr.Row():
+                save_name = gr.Textbox(label="💾 保存名称", scale=4,
+                                       placeholder="给这次病例起个名字，如「张三-高血压」")
+                save_btn = gr.Button("保存病例", scale=1)
+                history_dropdown = gr.Dropdown(label="📂 我的问诊记录", choices=[], scale=4)
+                load_btn = gr.Button("加载", scale=1)
+            save_status = gr.Markdown("")
+            reindex_status = gr.Markdown("")
+
+            with gr.Tabs():
+                with gr.Tab("📄 完整报告"):
+                    report_md = gr.Markdown("_（分析完成后此处将显示完整报告）_", elem_classes=["report-md"])
+                with gr.Tab("📚 检索详情"):
+                    rag_md = gr.Markdown("_（暂无检索结果）_", elem_classes=["detail-md"])
+                with gr.Tab("🧠 推理详情"):
+                    reasoner_md = gr.Markdown("_（暂无推理结果）_", elem_classes=["detail-md"])
+                with gr.Tab("💊 工具详情"):
+                    tools_md = gr.Markdown("_（暂无工具咨询结果）_", elem_classes=["detail-md"])
+
+            gr.HTML("""
+            <div class="disclaimer">
+                ⚠️ 免责声明: 本系统基于 AI 辅助分析，输出仅供医疗专业人员参考，
+                不能替代正式医疗诊断。最终诊断需要医师结合完整临床信息做出。
+            </div>
+            """)
 
         state = gr.State(value=initial_session)
-
-        gr.HTML("""
-        <div class="disclaimer">
-            ⚠️ 免责声明: 本系统基于 AI 辅助分析，输出仅供医疗专业人员参考，
-            不能替代正式医疗诊断。最终诊断需要医师结合完整临床信息做出。
-        </div>
-        """)
+        current_user = gr.State(value=None)
+        conv_name = gr.State(value="")
 
         outputs = [chatbot, msg, state, stage_label,
                    analyze_btn, reanalyze_btn, restart_btn,
                    rag_md, reasoner_md, tools_md, report_md, progress_html, back_btn]
 
-        send_btn.click(fn=on_send, inputs=[state, msg], outputs=outputs)
-        msg.submit(fn=on_send, inputs=[state, msg], outputs=outputs)
-        analyze_btn.click(fn=on_analyze_stream, inputs=[state], outputs=outputs)
-        reanalyze_btn.click(fn=on_reanalyze_stream, inputs=[state], outputs=outputs)
-        restart_btn.click(fn=on_restart, outputs=outputs)
-        back_btn.click(fn=on_back, inputs=[state], outputs=outputs)
-        save_btn.click(fn=on_save, inputs=[state, save_name], outputs=[save_status, session_dropdown])
-        load_btn.click(fn=on_load, inputs=[session_dropdown], outputs=outputs)
+        chat_outputs = outputs + [conv_name, history_dropdown]
+
+        # ---- 登录 / 注册 / 退出 ----
+        login_btn.click(fn=on_login, inputs=[username, password],
+                        outputs=[auth_status, current_user, conv_name, login_col, chat_col,
+                                 user_label, history_dropdown] + outputs)
+        register_btn.click(fn=on_register, inputs=[username, password],
+                           outputs=[auth_status, username, password])
+        logout_btn.click(fn=on_logout,
+                         outputs=[current_user, conv_name, login_col, chat_col, user_label,
+                                  auth_status, history_dropdown, username, password])
+
+        # ---- 问诊流程 ----
+        send_btn.click(fn=on_send, inputs=[state, msg, current_user, conv_name], outputs=chat_outputs)
+        msg.submit(fn=on_send, inputs=[state, msg, current_user, conv_name], outputs=chat_outputs)
+        analyze_btn.click(fn=on_analyze_stream, inputs=[state, current_user, conv_name], outputs=chat_outputs)
+        reanalyze_btn.click(fn=on_reanalyze_stream, inputs=[state, current_user, conv_name], outputs=chat_outputs)
+        restart_btn.click(fn=on_restart, outputs=chat_outputs)
+        back_btn.click(fn=on_back, inputs=[state, current_user, conv_name], outputs=chat_outputs)
+        save_btn.click(fn=on_save, inputs=[state, save_name, current_user, conv_name],
+                       outputs=[save_status, history_dropdown, conv_name])
+        load_btn.click(fn=on_load, inputs=[history_dropdown, current_user], outputs=chat_outputs)
         reindex_btn.click(fn=on_reindex, outputs=[reindex_status])
-        upload.change(fn=on_upload, inputs=[state, upload], outputs=outputs)
+        upload.change(fn=on_upload, inputs=[state, upload, current_user, conv_name], outputs=chat_outputs)
 
     return demo
 
